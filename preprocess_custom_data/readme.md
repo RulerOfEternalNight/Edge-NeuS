@@ -7,43 +7,7 @@
 ### [Example data link](https://drive.google.com/file/d/1nZBY--rvi3dUKGVz-d1jCpppkeD_tBiB/view?usp=sharing)
 
 
-
-### Option 1. Use ArUco 
-
-We take the images in `examples/thin_catbus` for example. These images were captured with an ArUco board. The pattern image of this board can be found in `./static/aruco_board.png`.
-
-**Step 1. Build the calibration code (c++)**  
-
-Dependencies: 
-
-- cnpy (https://github.com/rogersce/cnpy)
-- OpenCV
-
-Run commands
-
-```
-cd aruco_preprocess
-mkdir build
-cd build
-cmake .. & make
-cd ..
-```
-
-**Step 2. Get the preprocessed data**
-
-First indicate `data_dir`,`n_images` in `run.sh`. For example, `data_dir=./example/thin_catbus`
-
-Run commands
-
-```
-bash run.sh
-```
-
-Then the preprocessed data can be found in `${data_dir}/preprocessed`. Here we define the region of interest as the bounding sphere of the calibration board.
-
-
-
-### Option 2. Use COLMAP
+### Use COLMAP
 
 **Step 1. Run COLMAP SfM**
 
