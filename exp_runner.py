@@ -49,9 +49,17 @@ class Runner:
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
 
+        print("[DEBUG] learning_rate:", self.learning_rate)
+        print("[DEBUG] warm_up_end:", self.warm_up_end)
+
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
+
+        # Edge supervision (optional)
+        self.use_edge_loss = self.conf.get_bool('train.use_edge_loss', default=False)
+        self.edge_weight_factor = self.conf.get_float('train.edge_weight_factor', default=0.0)
+
         self.is_continue = is_continue
         self.mode = mode
         self.model_list = []
@@ -98,13 +106,18 @@ class Runner:
     def train(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
         self.update_learning_rate()
+        print("[DEBUG] initial optimizer lr:", self.optimizer.param_groups[0]['lr'])
         res_step = self.end_iter - self.iter_step
         image_perm = self.get_image_perm()
 
         for iter_i in tqdm(range(res_step)):
-            data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+            data = self.dataset.gen_random_rays_at(
+                image_perm[self.iter_step % len(image_perm)],
+                self.batch_size
+            )
 
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            rays_o, rays_d, true_rgb, mask, edge = \
+                data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10], data[:, 10: 11]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -117,9 +130,11 @@ class Runner:
                 mask = torch.ones_like(mask)
 
             mask_sum = mask.sum() + 1e-5
-            render_out = self.renderer.render(rays_o, rays_d, near, far,
-                                              background_rgb=background_rgb,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio())
+            render_out = self.renderer.render(
+                rays_o, rays_d, near, far,
+                background_rgb=background_rgb,
+                cos_anneal_ratio=self.get_cos_anneal_ratio()
+            )
 
             color_fine = render_out['color_fine']
             s_val = render_out['s_val']
@@ -128,24 +143,43 @@ class Runner:
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
 
-            # Loss
-            color_error = (color_fine - true_rgb) * mask
-            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-            psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+            # Edge-aware color loss: upweight photometric error on edge pixels
+            if self.use_edge_loss:
+                # edge in [0, 1]; weight = 1 + factor * edge
+                color_weight = 1.0 + self.edge_weight_factor * edge
+            else:
+                color_weight = torch.ones_like(edge)
+
+            # Combine with binary/object mask so background does not get upweighted
+            color_weight = color_weight * mask
+            color_weight_sum = color_weight.sum() + 1e-5
+
+            # L1 color error with per-ray weights
+            color_error = (color_fine - true_rgb).abs()
+            color_fine_loss = (color_weight.expand_as(color_error) * color_error).sum() / color_weight_sum
+            psnr = 20.0 * torch.log10(
+                1.0 / (((color_fine - true_rgb) ** 2 * mask).sum() / (mask_sum * 3.0)).sqrt()
+            )
 
             eikonal_loss = gradient_error
+            mask_loss = F.binary_cross_entropy(
+                weight_sum.clip(1e-3, 1.0 - 1e-3),
+                mask
+            )
 
-            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
-
-            loss = color_fine_loss +\
-                   eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+            loss = (
+                color_fine_loss
+                + eikonal_loss * self.igr_weight
+                + mask_loss * self.mask_weight
+            )
 
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
             self.iter_step += 1
+
+            self.update_learning_rate()
 
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
             self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
@@ -158,6 +192,10 @@ class Runner:
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
                 print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+                print(
+                        f"[DEBUG] step {self.iter_step} | lr={self.optimizer.param_groups[0]['lr']} "
+                        f"| edge_mean={edge.mean().item():.4f}"
+                )
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -168,10 +206,84 @@ class Runner:
             if self.iter_step % self.val_mesh_freq == 0:
                 self.validate_mesh()
 
-            self.update_learning_rate()
 
-            if self.iter_step % len(image_perm) == 0:
-                image_perm = self.get_image_perm()
+    # def train(self):
+    #     self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
+    #     self.update_learning_rate()
+    #     res_step = self.end_iter - self.iter_step
+    #     image_perm = self.get_image_perm()
+
+    #     for iter_i in tqdm(range(res_step)):
+    #         data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+
+    #         rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+    #         near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+
+    #         background_rgb = None
+    #         if self.use_white_bkgd:
+    #             background_rgb = torch.ones([1, 3])
+
+    #         if self.mask_weight > 0.0:
+    #             mask = (mask > 0.5).float()
+    #         else:
+    #             mask = torch.ones_like(mask)
+
+    #         mask_sum = mask.sum() + 1e-5
+    #         render_out = self.renderer.render(rays_o, rays_d, near, far,
+    #                                           background_rgb=background_rgb,
+    #                                           cos_anneal_ratio=self.get_cos_anneal_ratio())
+
+    #         color_fine = render_out['color_fine']
+    #         s_val = render_out['s_val']
+    #         cdf_fine = render_out['cdf_fine']
+    #         gradient_error = render_out['gradient_error']
+    #         weight_max = render_out['weight_max']
+    #         weight_sum = render_out['weight_sum']
+
+    #         # Loss
+    #         color_error = (color_fine - true_rgb) * mask
+    #         color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
+    #         psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+
+    #         eikonal_loss = gradient_error
+
+    #         mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+
+    #         loss = color_fine_loss +\
+    #                eikonal_loss * self.igr_weight +\
+    #                mask_loss * self.mask_weight
+
+    #         self.optimizer.zero_grad()
+    #         loss.backward()
+    #         self.optimizer.step()
+
+    #         self.iter_step += 1
+
+    #         self.writer.add_scalar('Loss/loss', loss, self.iter_step)
+    #         self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
+    #         self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+    #         self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+    #         self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
+    #         self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
+    #         self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
+
+    #         if self.iter_step % self.report_freq == 0:
+    #             print(self.base_exp_dir)
+    #             print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+
+    #         if self.iter_step % self.save_freq == 0:
+    #             self.save_checkpoint()
+
+    #         if self.iter_step % self.val_freq == 0:
+    #             self.validate_image()
+
+    #         if self.iter_step % self.val_mesh_freq == 0:
+    #             self.validate_mesh()
+
+    #         self.update_learning_rate()
+
+    #         if self.iter_step % len(image_perm) == 0:
+    #             image_perm = self.get_image_perm()
 
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)

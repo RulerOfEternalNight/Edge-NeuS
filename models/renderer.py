@@ -25,15 +25,32 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     return u
 
 
+# def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
+#     print('threshold: {}'.format(threshold))
+#     u = extract_fields(bound_min, bound_max, resolution, query_func)
+#     vertices, triangles = mcubes.marching_cubes(u, threshold)
+#     b_max_np = bound_max.detach().cpu().numpy()
+#     b_min_np = bound_min.detach().cpu().numpy()
+
+#     vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
+#     return vertices, triangles
+
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     print('threshold: {}'.format(threshold))
     u = extract_fields(bound_min, bound_max, resolution, query_func)
     vertices, triangles = mcubes.marching_cubes(u, threshold)
+
     b_max_np = bound_max.detach().cpu().numpy()
     b_min_np = bound_min.detach().cpu().numpy()
 
+    # Make sure bounds are 3D (x, y, z). If they are 4D (homogeneous), drop the last coord.
+    if b_max_np.shape[-1] == 4:
+        b_max_np = b_max_np[..., :3]
+        b_min_np = b_min_np[..., :3]
+
     vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
     return vertices, triangles
+
 
 
 def sample_pdf(bins, weights, n_samples, det=False):
